@@ -82,7 +82,7 @@ The `deliberate` keyword is optional: `./jurgen deliberate "<task>"` works ident
 A real deliberation on the prompt *"I need a doc to claim why this is better than loop engineering"*. The harness seated three stances, ran three challenge/response rounds, closed the graph with **two theses surviving equally**, and returned `UNDERDETERMINED` — handing the normative fork back to a human rather than forcing a winner.
 
 ```bash
-./jurgen "I need a doc to claim why this is better than loop engnierring" --max-stakeholders 3
+./jurgen "I need a doc to claim why this is better than loop engineering" --max-stakeholders 3
 ```
 
 ![Example run — a discursive deliberation, rendered terminal output](docs/example-run.svg)
