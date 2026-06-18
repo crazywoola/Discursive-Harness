@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+ledger.json
+*.ledger.json
+.DS_Store

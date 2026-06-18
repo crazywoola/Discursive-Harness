@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""
+jurgen — a discursive (Habermasian) multi-agent deliberation harness.
+
+Named for Jürgen Habermas. This is NOT a reflexive self-critique loop; it stages
+a *dialogue* among opposed party-agents whose legitimacy lives in reasons
+exchanged under power-free conditions, recorded in a reopenable reason ledger.
+
+The "fundamental agent" is Claude Code itself: every party / stakeholder-finder
+is a headless `claude -p` invocation. The REFEREE is deliberately NOT an agent —
+it is deterministic, content-blind code (see plan §5). That separation is the
+whole game.
+
+Usage:
+    ./jurgen "Should we ship feature X before the audit?"
+    ./jurgen deliberate "<task>" --model claude-sonnet-4-6 --max-rounds 3
+    ./jurgen "<task>" --json > ledger.json
+"""
+
+import argparse
+import concurrent.futures
+import json
+import re
+import subprocess
+import sys
+import textwrap
+import time
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Terminal helpers
+# ──────────────────────────────────────────────────────────────────────────────
+class C:
+    R = "\033[0m"; B = "\033[1m"; DIM = "\033[2m"
+    RED = "\033[31m"; GRN = "\033[32m"; YEL = "\033[33m"
+    BLU = "\033[34m"; MAG = "\033[35m"; CYN = "\033[36m"
+
+_USE_COLOR = sys.stdout.isatty()
+def c(s, color):
+    return f"{color}{s}{C.R}" if _USE_COLOR else s
+
+def log(msg, quiet=False):
+    if not quiet:
+        print(c("⊢ ", C.DIM) + msg, file=sys.stderr, flush=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# The fundamental agent: a headless `claude -p` invocation
+# ──────────────────────────────────────────────────────────────────────────────
+SYSTEM = (
+    "You are a single party-agent inside a structured discourse. You argue ONLY "
+    "from the assigned stance. You never use tools or read files; reason purely "
+    "from the prompt. When asked for JSON, output ONLY raw JSON — no prose, no "
+    "markdown fences. Be terse and substantive."
+)
+
+class AgentError(Exception):
+    pass
+
+def call_claude(prompt: str, model: str, timeout: int = 180) -> str:
+    """One headless turn of Claude Code. Returns the agent's text (.result)."""
+    cmd = [
+        "claude", "-p", prompt,
+        "--model", model,
+        "--system-prompt", SYSTEM,
+        "--output-format", "json",
+    ]
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        raise AgentError("agent timed out")
+    if out.returncode != 0:
+        raise AgentError(f"claude exited {out.returncode}: {out.stderr[:300]}")
+    try:
+        payload = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        raise AgentError(f"could not parse claude envelope: {out.stdout[:300]}")
+    if payload.get("is_error"):
+        raise AgentError(f"agent error: {payload.get('result','')[:300]}")
+    return payload.get("result", "")
+
+
+_JSON_RE = re.compile(r"(\{.*\}|\[.*\])", re.DOTALL)
+
+def extract_json(text: str):
+    """Pull the first JSON object/array out of an agent's free text."""
+    text = text.strip()
+    # strip fenced code blocks if present
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = _JSON_RE.search(text)
+    if m:
+        return json.loads(m.group(1))
+    raise AgentError(f"no JSON found in agent output: {text[:200]}")
+
+def agent_json(prompt: str, model: str, retries: int = 1):
+    last = None
+    for attempt in range(retries + 1):
+        raw = call_claude(prompt, model)
+        try:
+            return extract_json(raw)
+        except (AgentError, json.JSONDecodeError) as e:
+            last = e
+            prompt = prompt + "\n\nYour previous reply was not valid JSON. Output ONLY raw JSON."
+    raise AgentError(f"agent never produced JSON: {last}")
+
+
+def parallel_map(fn, items, workers=6):
+    results = [None] * len(items)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fn, it): i for i, it in enumerate(items)}
+        for fut in concurrent.futures.as_completed(futs):
+            i = futs[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                results[i] = e
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# The Argument Graph (plan §3) — load-bearing shared state
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class Claim:
+    id: str
+    content: str
+    type: str            # "thesis" | "sub_claim"
+    proposedBy: str      # HIDDEN from agent-facing views
+    status: str = "undefended"
+    createdRound: int = 0
+    supersededBy: Optional[str] = None
+
+@dataclass
+class Reason:
+    id: str
+    content: str
+    supports: str        # Claim.id or Reason.id
+    proposedBy: str
+    groundType: str      # empirical|inferential|normative|interpretive
+
+@dataclass
+class Challenge:
+    id: str
+    target: str          # Claim.id or Reason.id
+    challengeType: str   # rebuttal|undercut|undermine|challenge_universalizability
+    content: str
+    proposedBy: str
+    status: str = "open" # open|answered|conceded|dismissed
+    createdRound: int = 0
+
+@dataclass
+class Response:
+    id: str
+    respondsTo: str      # Challenge.id
+    responseType: str    # rebut|amend|concede
+    content: str
+    proposedBy: str
+    createdRound: int = 0
+    newClaimId: Optional[str] = None
+
+
+VALID_CHALLENGE_TYPES = {
+    "rebuttal", "undercut", "undermine", "challenge_universalizability"
+}
+GROUND_TO_ATTACK = {
+    "empirical": "undermine",
+    "inferential": "undercut",
+    "normative": "challenge_universalizability",
+    "interpretive": "undermine",
+}
+
+class ArgumentGraph:
+    def __init__(self):
+        self.claims: dict[str, Claim] = {}
+        self.reasons: dict[str, Reason] = {}
+        self.challenges: dict[str, Challenge] = {}
+        self.responses: dict[str, Response] = {}
+        self._ctr = {"c": 0, "r": 0, "ch": 0, "rs": 0}
+
+    def _id(self, kind):
+        self._ctr[kind] += 1
+        return f"{kind}{self._ctr[kind]}"
+
+    def add_claim(self, content, ctype, by, rnd):
+        cid = self._id("c")
+        self.claims[cid] = Claim(cid, content, ctype, by, "undefended", rnd)
+        return cid
+
+    def add_reason(self, content, supports, by, ground):
+        rid = self._id("r")
+        ground = ground if ground in GROUND_TO_ATTACK else "inferential"
+        self.reasons[rid] = Reason(rid, content, supports, by, ground)
+        return rid
+
+    def add_challenge(self, target, ctype, content, by, rnd):
+        chid = self._id("ch")
+        self.challenges[chid] = Challenge(chid, target, ctype, content, by, "open", rnd)
+        return chid
+
+    def add_response(self, responds_to, rtype, content, by, rnd, new_claim_id=None):
+        rsid = self._id("rs")
+        self.responses[rsid] = Response(rsid, responds_to, rtype, content, by, rnd, new_claim_id)
+        return rsid
+
+    # ── lookups ──
+    def reasons_for(self, target_id):
+        return [r for r in self.reasons.values() if r.supports == target_id]
+
+    def attacks_on(self, target_id):
+        return [c for c in self.challenges.values() if c.target == target_id]
+
+    def responses_to(self, challenge_id):
+        return [r for r in self.responses.values() if r.respondsTo == challenge_id]
+
+    # ── anonymized, author-stripped view for Phase 2 (invariant I3) ──
+    def agent_view(self):
+        def claim_v(cl):
+            return {
+                "id": cl.id, "content": cl.content, "type": cl.type,
+                "status": cl.status,
+                "reasons": [
+                    {"id": r.id, "content": r.content, "groundType": r.groundType}
+                    for r in self.reasons_for(cl.id)
+                ],
+            }
+        return {
+            "claims": [claim_v(cl) for cl in self.claims.values()
+                       if cl.status != "withdrawn"],
+            "open_challenges": [
+                {"id": ch.id, "target": ch.target, "type": ch.challengeType,
+                 "content": ch.content, "status": ch.status}
+                for ch in self.challenges.values() if ch.status == "open"
+            ],
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# The Referee (plan §5) — deterministic, content-blind. NOT an agent.
+# ──────────────────────────────────────────────────────────────────────────────
+def referee_update(graph: ArgumentGraph):
+    # 1. Challenge status from PRESENCE of responses (form only, never substance).
+    for ch in graph.challenges.values():
+        if ch.status in ("conceded", "dismissed"):
+            continue
+        resps = graph.responses_to(ch.id)
+        if not resps:
+            ch.status = "open"
+            continue
+        # concession closes the challenge by capitulation
+        if any(r.responseType == "concede" for r in resps):
+            ch.status = "conceded"
+            continue
+        # a rebut/amend response that is not itself open-challenged answers it
+        answered = False
+        for r in resps:
+            if r.newClaimId:
+                # if the amendment claim is itself open-challenged, not answered
+                open_on_new = [a for a in graph.attacks_on(r.newClaimId)
+                               if a.status == "open"]
+                if open_on_new:
+                    continue
+            answered = True
+        ch.status = "answered" if answered else "open"
+
+    # 2. Claim status from open challenges + reason presence.
+    for cl in graph.claims.values():
+        if cl.status == "withdrawn":
+            continue
+        open_ch = [c for c in graph.attacks_on(cl.id) if c.status == "open"]
+        if open_ch:
+            cl.status = "challenged"
+        elif graph.reasons_for(cl.id):
+            cl.status = "defended"
+        else:
+            cl.status = "undefended"
+
+    # 3. Propagate undermined reasons down to the claims they support.
+    for r in graph.reasons.values():
+        open_on_reason = [a for a in graph.attacks_on(r.id) if a.status == "open"]
+        if open_on_reason and r.supports in graph.claims:
+            cl = graph.claims[r.supports]
+            # only the reasons of this claim — if ALL its reasons are knocked out,
+            # it can be no better than challenged
+            live_reasons = [rr for rr in graph.reasons_for(cl.id)
+                            if not [a for a in graph.attacks_on(rr.id) if a.status == "open"]]
+            if not live_reasons and cl.status == "defended":
+                cl.status = "challenged"
+
+
+# The ONLY content the referee may touch (plan §5.3): formal dismissal.
+FORMAL_DEFECTS = {"non_responsiveness", "circularity", "settled_repetition"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# validate_challenge — the submission gate (plan §4.2)
+# Rejects (silently drops, does NOT record as dismissed).
+# ──────────────────────────────────────────────────────────────────────────────
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s.lower()).strip()
+
+def validate_challenge(graph, target, ctype, content) -> Optional[str]:
+    if ctype not in VALID_CHALLENGE_TYPES:
+        return "invalid challenge type"
+    if not content or not content.strip():
+        return "bare negation (no reason given)"            # I1
+    # dead target
+    if target in graph.claims and graph.claims[target].status == "withdrawn":
+        return "dead target (withdrawn)"
+    tgt_dead_ch = graph.challenges.get(target)
+    if tgt_dead_ch and tgt_dead_ch.status in ("conceded",):
+        return "dead target (conceded)"
+    if target not in graph.claims and target not in graph.reasons:
+        return "target does not exist"
+    # substantive duplicate → anti-filibuster (plan §4.2)
+    for ch in graph.challenges.values():
+        if ch.target == target and ch.status in ("open", "answered"):
+            if _norm(ch.content) == _norm(content):
+                return "duplicate of a live challenge"
+    return None  # valid
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Convergence & termination (plan §7)
+# ──────────────────────────────────────────────────────────────────────────────
+CONTINUE = "CONTINUE"
+RATIONAL_CONSENSUS = "RATIONAL_CONSENSUS"
+UNDERDETERMINED = "UNDERDETERMINED"
+REASONABLE_DISAGREEMENT = "REASONABLE_DISAGREEMENT"
+
+def convergence_state(graph, no_progress_rounds, stall_rounds):
+    open_ch = [c for c in graph.challenges.values() if c.status == "open"]
+    theses = [c for c in graph.claims.values()
+              if c.type == "thesis" and c.status != "withdrawn"]
+    surviving = [c for c in theses if c.status == "defended"]
+    if not open_ch:
+        if len(surviving) == 1:
+            return RATIONAL_CONSENSUS
+        if len(surviving) > 1:
+            return UNDERDETERMINED
+        # zero surviving but nothing open: also underdetermined / stalled
+    if no_progress_rounds >= stall_rounds:
+        return REASONABLE_DISAGREEMENT
+    return CONTINUE
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Agent prompts
+# ──────────────────────────────────────────────────────────────────────────────
+def p_stakeholders(task):
+    return textwrap.dedent(f"""\
+    A decision must be made:
+
+        {task}
+
+    Identify the distinct STANCES / affected parties / competing values that
+    deserve a seat at this deliberation. Each must be a genuinely DISTINCT
+    position, not a rewording. Include parties who are affected but typically
+    unrepresented or silent.
+
+    Output ONLY a JSON array (2 to 5 items) of:
+      {{"id": "short_snake_id", "name": "Party name", "stance": "one-line description of what this party fundamentally cares about / argues for"}}
+    """)
+
+def p_missing_party(task, existing):
+    listing = "\n".join(f'  - {s["name"]}: {s["stance"]}' for s in existing)
+    return textwrap.dedent(f"""\
+    Decision under deliberation:
+
+        {task}
+
+    Current parties already seated:
+    {listing}
+
+    Your ONLY job: name ONE affected-but-unrepresented party or competing value
+    that is MISSING and would change the deliberation. Do not duplicate a seated
+    party. If the set is genuinely complete, say so.
+
+    Output ONLY JSON:
+      {{"missing": null}}   if complete, OR
+      {{"missing": {{"id":"...", "name":"...", "stance":"..."}}}}
+    """)
+
+def p_thesis(task, party):
+    return textwrap.dedent(f"""\
+    Decision under deliberation:
+
+        {task}
+
+    You represent this party:
+      {party['name']} — {party['stance']}
+
+    Propose YOUR thesis (the decision you advocate) and the reasons supporting it.
+    Each reason must have a groundType:
+      "empirical"    = a factual claim
+      "inferential"  = a reasoning step
+      "normative"    = a value claim
+      "interpretive" = a reading of what the task means
+
+    Output ONLY JSON:
+      {{"thesis": "one-sentence decision you advocate",
+        "reasons": [{{"content":"...", "groundType":"empirical|inferential|normative|interpretive"}}]}}
+    Give 2-3 reasons.
+    """)
+
+def p_act(task, party, view):
+    return textwrap.dedent(f"""\
+    Decision under deliberation:
+
+        {task}
+
+    You represent: {party['name']} — {party['stance']}
+
+    Current argument graph (authorship hidden — judge only the reasons):
+    {json.dumps(view, indent=2)}
+
+    Choose ONE action. Either CHALLENGE a claim/reason you find unjustified
+    (you must give a reason — bare disagreement is rejected), or RESPOND to an
+    open challenge, or PASS if you have nothing live to add.
+
+    Challenge types:
+      "undermine"  = attack the fact/premise a reason rests on (empirical/interpretive)
+      "undercut"   = attack the reason→conclusion link (inferential)
+      "rebuttal"   = even if the reason holds, the conclusion fails (counter-reason)
+      "challenge_universalizability" = (normative only) not acceptable to all affected
+
+    Response types: "rebut" (counter-reason), "amend" (revise the claim), "concede".
+
+    Output ONLY ONE of these JSON shapes:
+      {{"kind":"challenge","target":"<claim or reason id>","challengeType":"...","content":"the reason this is unjustified"}}
+      {{"kind":"respond","challenge":"<challenge id>","responseType":"rebut|amend|concede","content":"...","amended_thesis":"<only if amend>"}}
+      {{"kind":"pass"}}
+    """)
+
+def p_synthesis(task, ledger_core):
+    return textwrap.dedent(f"""\
+    You are the Verdict Synthesizer for a discursive deliberation. You do NOT
+    pick a winner by preference — you report what the argument graph determined.
+
+    Decision: {task}
+
+    Graph outcome (machine-computed, authoritative):
+    {json.dumps(ledger_core, indent=2)}
+
+    Write a brief plain-language summary (max 150 words) of: what (if anything)
+    was settled, what remains genuinely contested and WHY, and — if the outcome
+    is UNDERDETERMINED or REASONABLE_DISAGREEMENT — the precise normative fork
+    that must be handed back to affected humans.
+
+    Output ONLY JSON: {{"summary":"...", "decision_point_for_human":"... or null"}}
+    """)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# The deliberation (plan §4.1)
+# ──────────────────────────────────────────────────────────────────────────────
+def deliberate(task, model, max_rounds, stall_rounds, max_stakeholders, quiet):
+    graph = ArgumentGraph()
+    t0 = time.time()
+
+    # ── Phase 0: Stakeholder identification ──
+    log(c("Phase 0", C.B) + " — identifying stakeholders…", quiet)
+    parties = agent_json(p_stakeholders(task), model)
+    if not isinstance(parties, list):
+        raise AgentError("stakeholder phase did not return a list")
+    parties = parties[:max_stakeholders]
+    direct_ids = {p["id"] for p in parties}
+
+    # adversarial completeness pass (plan §6) — record who we'd left out
+    recovered = []
+    for _ in range(2):
+        if len(parties) >= max_stakeholders:
+            break
+        res = agent_json(p_missing_party(task, parties), model)
+        miss = res.get("missing") if isinstance(res, dict) else None
+        if not miss:
+            break
+        if miss.get("id") in {p["id"] for p in parties}:
+            break
+        parties.append(miss)
+        recovered.append(miss)
+        log(f"  de-occlusion: recovered missing party → {c(miss['name'], C.YEL)}", quiet)
+
+    # anti-domination gate #1: no empty seat
+    if len(parties) < 2:
+        raise AgentError("fewer than 2 distinct stances — cannot stage discourse")
+    for p in parties:
+        log(f"  seat: {c(p['name'], C.CYN)} — {p['stance']}", quiet)
+
+    # ── Phase 1: Claim round ──
+    log(c("Phase 1", C.B) + " — claim round (theses + reasons)…", quiet)
+    res = parallel_map(lambda p: agent_json(p_thesis(task, p), model), parties)
+    for p, r in zip(parties, res):
+        if isinstance(r, Exception):
+            log(f"  {c('!', C.RED)} {p['name']} failed to propose: {r}", quiet)
+            continue
+        cid = graph.add_claim(r["thesis"], "thesis", p["id"], 0)
+        for rsn in r.get("reasons", []):
+            graph.add_reason(rsn.get("content", ""), cid, p["id"],
+                             rsn.get("groundType", "inferential"))
+    referee_update(graph)
+    log(f"  {len(graph.claims)} theses, {len(graph.reasons)} reasons on the graph", quiet)
+
+    # ── Phase 2: Challenge & Response (core loop) ──
+    no_progress = 0
+    state = CONTINUE
+    for rnd in range(1, max_rounds + 1):
+        log(c(f"Phase 2 · round {rnd}", C.B) + " — challenge & response…", quiet)
+        view = graph.agent_view()
+        before = (len(graph.challenges), len(graph.responses))
+
+        actions = parallel_map(
+            lambda p: agent_json(p_act(task, p, view), model), parties
+        )
+
+        applied = 0
+        for p, action in zip(parties, actions):
+            if isinstance(action, Exception):
+                continue
+            kind = action.get("kind")
+            if kind == "challenge":
+                target = action.get("target", "")
+                ctype = action.get("challengeType", "")
+                content = action.get("content", "")
+                rej = validate_challenge(graph, target, ctype, content)
+                if rej:
+                    log(f"  {c('drop', C.DIM)} challenge from {p['name']}: {rej}", quiet)
+                    continue
+                graph.add_challenge(target, ctype, content, p["id"], rnd)
+                applied += 1
+                log(f"  {c('⚔', C.RED)} {p['name']} {ctype} → {target}", quiet)
+            elif kind == "respond":
+                chid = action.get("challenge", "")
+                if chid not in graph.challenges:
+                    continue
+                rtype = action.get("responseType", "rebut")
+                content = action.get("content", "")
+                new_claim_id = None
+                if rtype == "amend" and action.get("amended_thesis"):
+                    # amend = new claim + withdraw old (invariant I4)
+                    orig = graph.challenges[chid].target
+                    new_claim_id = graph.add_claim(
+                        action["amended_thesis"], "thesis", p["id"], rnd)
+                    if orig in graph.claims:
+                        graph.claims[orig].status = "withdrawn"
+                        graph.claims[orig].supersededBy = new_claim_id
+                elif rtype == "concede":
+                    tgt = graph.challenges[chid].target
+                    if tgt in graph.claims:
+                        graph.claims[tgt].status = "withdrawn"
+                graph.add_response(chid, rtype, content, p["id"], rnd, new_claim_id)
+                applied += 1
+                log(f"  {c('🛡', C.GRN)} {p['name']} {rtype} → {chid}", quiet)
+
+        referee_update(graph)
+        after = (len(graph.challenges), len(graph.responses))
+        no_progress = no_progress + 1 if after == before else 0
+
+        state = convergence_state(graph, no_progress, stall_rounds)
+        log(f"  → graph state: {c(state, C.MAG)} "
+            f"(open challenges: {sum(1 for x in graph.challenges.values() if x.status=='open')})",
+            quiet)
+        if state != CONTINUE:
+            break
+    else:
+        # rounds exhausted with the loop never breaking
+        open_ch = [c for c in graph.challenges.values() if c.status == "open"]
+        state = REASONABLE_DISAGREEMENT if open_ch else \
+            convergence_state(graph, stall_rounds, stall_rounds)
+
+    # ── Phase 4: Verdict & reason ledger (plan §8) ──
+    log(c("Phase 4", C.B) + " — synthesizing verdict ledger…", quiet)
+    ledger = build_ledger(graph, state, task, recovered, parties, model)
+    ledger["_meta"] = {
+        "model": model, "rounds_run": rnd if 'rnd' in dir() else 0,
+        "elapsed_sec": round(time.time() - t0, 1),
+    }
+    return graph, ledger
+
+
+def reason_chain(graph, claim_id):
+    return [
+        {"id": r.id, "content": r.content, "groundType": r.groundType}
+        for r in graph.reasons_for(claim_id)
+    ]
+
+def build_ledger(graph, state, task, recovered, parties, model):
+    theses = [c for c in graph.claims.values() if c.type == "thesis"]
+    surviving = [c for c in theses
+                 if c.status in ("defended",) and c.status != "withdrawn"]
+
+    defeated = []
+    for cl in theses:
+        if cl.status in ("withdrawn", "challenged"):
+            killers = [ch for ch in graph.attacks_on(cl.id)
+                       if ch.status in ("open", "answered")]
+            why = None
+            if cl.status == "withdrawn" and cl.supersededBy:
+                why = f"amended into {cl.supersededBy}"
+            elif killers:
+                k = killers[0]
+                why = f"{k.challengeType}: {k.content}"
+            elif cl.status == "withdrawn":
+                why = "conceded / withdrawn by author"
+            defeated.append({
+                "claim": cl.content,
+                "claim_id": cl.id,
+                "killed_by": killers[0].id if killers else None,
+                "why": why or "no surviving reason",
+            })
+
+    unresolved = [
+        {"id": ch.id, "target": ch.target, "type": ch.challengeType,
+         "content": ch.content}
+        for ch in graph.challenges.values() if ch.status == "open"
+    ]
+
+    ledger_core = {
+        "outcome_type": state,
+        "surviving_claims": [
+            {"id": cl.id, "claim": cl.content, "status": cl.status,
+             "reasons": reason_chain(graph, cl.id)}
+            for cl in surviving
+        ],
+        "defeated_alternatives": defeated,
+        "unresolved_challenges": unresolved,
+        "excluded_then_included": recovered,
+    }
+
+    # human-handback synthesis (form-only narration; the graph already decided)
+    handback = None
+    summary = None
+    try:
+        syn = agent_json(p_synthesis(task, ledger_core), model)
+        summary = syn.get("summary")
+        handback = syn.get("decision_point_for_human")
+    except AgentError:
+        pass
+
+    ledger_core["task"] = task
+    ledger_core["summary"] = summary
+    ledger_core["decision_point_for_human"] = handback
+    ledger_core["seated_parties"] = parties
+    return ledger_core
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pretty printer
+# ──────────────────────────────────────────────────────────────────────────────
+OUTCOME_BLURB = {
+    RATIONAL_CONSENSUS: ("RATIONAL CONSENSUS", C.GRN,
+        "One thesis survived with no open challenge."),
+    UNDERDETERMINED: ("UNDERDETERMINED", C.YEL,
+        "Multiple theses survived equally — selection handed to humans."),
+    REASONABLE_DISAGREEMENT: ("REASONABLE DISAGREEMENT", C.MAG,
+        "Open challenges persist — a map of WHY consensus is impossible."),
+}
+
+def print_ledger(ledger):
+    name, color, blurb = OUTCOME_BLURB.get(
+        ledger["outcome_type"], (ledger["outcome_type"], C.YEL, ""))
+    bar = "═" * 70
+    print()
+    print(c(bar, color))
+    print(c(f"  VERDICT: {name}", C.B + color))
+    print(c(f"  {blurb}", C.DIM))
+    print(c(bar, color))
+    print()
+    print(c("TASK", C.B) + f"  {ledger['task']}")
+    print()
+
+    if ledger.get("summary"):
+        print(c("SUMMARY", C.B))
+        for line in textwrap.wrap(ledger["summary"], 68):
+            print("  " + line)
+        print()
+
+    print(c("SURVIVING CLAIMS", C.B + C.GRN))
+    if not ledger["surviving_claims"]:
+        print(c("  (none — no thesis is currently defended)", C.DIM))
+    for cl in ledger["surviving_claims"]:
+        print(f"  • [{cl['id']}] {c(cl['claim'], C.GRN)}")
+        for r in cl["reasons"]:
+            print(c(f"      ↳ ({r['groundType']}) {r['content']}", C.DIM))
+    print()
+
+    print(c("DEFEATED ALTERNATIVES", C.B + C.RED) + c("  (reopenable)", C.DIM))
+    if not ledger["defeated_alternatives"]:
+        print(c("  (none)", C.DIM))
+    for d in ledger["defeated_alternatives"]:
+        print(f"  ✗ [{d['claim_id']}] {d['claim']}")
+        print(c(f"      killed_by {d['killed_by']}: {d['why']}", C.DIM))
+    print()
+
+    print(c("UNRESOLVED CHALLENGES", C.B + C.MAG))
+    if not ledger["unresolved_challenges"]:
+        print(c("  (none — graph closed)", C.DIM))
+    for u in ledger["unresolved_challenges"]:
+        print(f"  ? [{u['id']}] {u['type']} → {u['target']}")
+        print(c(f"      {u['content']}", C.DIM))
+    print()
+
+    if ledger.get("excluded_then_included"):
+        print(c("EXCLUDED-THEN-INCLUDED (de-occlusion)", C.B + C.CYN))
+        for p in ledger["excluded_then_included"]:
+            print(f"  + {p['name']} — {p['stance']}")
+        print()
+
+    if ledger.get("decision_point_for_human"):
+        print(c("⟶ DECISION POINT FOR HUMAN", C.B + C.YEL))
+        for line in textwrap.wrap(ledger["decision_point_for_human"], 68):
+            print(c("  " + line, C.YEL))
+        print()
+
+    m = ledger.get("_meta", {})
+    print(c(f"[{m.get('model','?')} · {m.get('elapsed_sec','?')}s]", C.DIM))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+def main():
+    ap = argparse.ArgumentParser(
+        prog="jurgen",
+        description="Discursive (Habermasian) multi-agent deliberation harness. "
+                    "Party-agents are headless Claude Code invocations; the "
+                    "referee is deterministic code.",
+    )
+    ap.add_argument("task", nargs="?", help="the decision/question to deliberate")
+    ap.add_argument("cmd_or_task", nargs="?", help=argparse.SUPPRESS)
+    ap.add_argument("--model", default="claude-sonnet-4-6",
+                    help="model for party-agents (default: claude-sonnet-4-6)")
+    ap.add_argument("--max-rounds", type=int, default=3,
+                    help="max challenge/response rounds (default: 3)")
+    ap.add_argument("--stall-rounds", type=int, default=2,
+                    help="rounds with no progress → reasonable disagreement (default: 2)")
+    ap.add_argument("--max-stakeholders", type=int, default=4,
+                    help="cap on seated parties (default: 4)")
+    ap.add_argument("--json", action="store_true", help="emit raw ledger JSON only")
+    ap.add_argument("--out", help="write ledger JSON to this file")
+    ap.add_argument("--quiet", action="store_true", help="suppress phase logging")
+    args = ap.parse_args()
+
+    # allow `jurgen deliberate "<task>"` as well as `jurgen "<task>"`
+    task = args.task
+    if task == "deliberate" and args.cmd_or_task:
+        task = args.cmd_or_task
+    if not task:
+        ap.print_help()
+        sys.exit(1)
+
+    quiet = args.quiet or args.json
+    try:
+        graph, ledger = deliberate(
+            task, args.model, args.max_rounds, args.stall_rounds,
+            args.max_stakeholders, quiet)
+    except AgentError as e:
+        print(c(f"jurgen: agent failure: {e}", C.RED), file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print(c("\njurgen: interrupted", C.RED), file=sys.stderr)
+        sys.exit(130)
+
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(ledger, f, indent=2)
+        log(f"ledger written to {args.out}", quiet)
+
+    if args.json:
+        print(json.dumps(ledger, indent=2))
+    else:
+        print_ledger(ledger)
+
+
+if __name__ == "__main__":
+    main()
